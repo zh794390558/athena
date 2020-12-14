@@ -20,6 +20,7 @@
 
 from absl import logging
 import tensorflow as tf
+import numpy as np
 
 
 class ScaledDotProductAttention(tf.keras.layers.Layer):
@@ -564,3 +565,189 @@ class StepwiseMonotonicAttention(LocationAttention):
         attn_c = tf.reduce_sum(value * tf.reshape(attn_weight, [batch, x_steps, 1]), axis=1)
         return attn_c, attn_weight
 
+layers = tf.keras.layers
+
+class AttentionMechanism(tf.keras.layers.Layer):
+    """Single-head attention layer.
+    Args:
+        kdim (int): dimension of key
+        qdim (int): dimension of query
+        atype (str): type of attention mechanisms
+        adim: (int) dimension of attention space
+        sharpening_factor (float): sharpening factor in the softmax layer
+            for attention weights
+        sigmoid_smoothing (bool): replace the softmax layer for attention weights
+            with the sigmoid function
+        conv_out_channels (int): number of channels of conv outputs.
+            This is used for location-based attention.
+        conv_kernel_size (int): size of kernel.
+            This must be the odd number.
+        dropout (float): dropout probability for attention weights
+        lookahead (int): lookahead frames for triggered attention
+    """
+
+    def __init__(self, kdim, qdim, adim, atype,
+                 sharpening_factor=1, sigmoid_smoothing=False,
+                 conv_out_channels=10, conv_kernel_size=201, dropout=0.,
+                 lookahead=2):
+
+        super().__init__()
+
+        assert conv_kernel_size % 2 == 1, "Kernel size should be odd for 'same' conv."
+        self.atype = atype
+        self.adim = adim
+        self.sharpening_factor = sharpening_factor
+        self.sigmoid_smoothing = sigmoid_smoothing
+        self.n_heads = 1
+        self.lookahead = lookahead
+        self.reset()
+
+        # attention dropout applied after the softmax layer
+        self.dropout = layers.Dropout(dropout)
+
+        if atype == 'no':
+            raise NotImplementedError
+            # NOTE: sequence-to-sequence without attention (use the last state as a context vector)
+
+        elif atype in ['add', 'triggered_attention']:
+            #(kdim, adim)
+            self.w_key = layers.Dense(adim)
+            #(qdim, adim)
+            self.w_query = layers.Dense(adim, use_bias=False)
+            #(adim, 1)
+            self.v = layers.Dense(1, use_bias=False)
+
+        elif atype == 'location':
+            # (kdim, adim)
+            self.w_key = layers.Dense(adim)
+            # (qdim, adim, bias=False)
+            self.w_query = layers.Dense(adim, use_bias=False)
+            self.conv = layers.Conv2D(
+                                  conv_out_channels,
+                                  (1, conv_kernel_size),
+                                  strides=1,
+                                  padding='same',
+                                  use_bias=False)
+            # (conv_out_channels, adim, bias=False)
+            self.w_conv = layers.Dense(adim, use_bias=False)
+            #(adim, 1, bias=False)
+            self.v = layers.Dense(1, use_bias=False)
+
+        elif atype == 'dot':
+            #(kdim, adim, bias=False)
+            self.w_key = layers.Dense(adim, use_bias=False)
+            #(qdim, adim, bias=False)
+            self.w_query = layers.Dense(adim, use_bias=False)
+
+        elif atype == 'luong_dot':
+            assert kdim == qdim
+            # NOTE: no additional parameters
+
+        elif atype == 'luong_general':
+            #(kdim, qdim, bias=False)
+            self.w_key = layers.Dense(qdim, use_bias=False)
+
+        elif atype == 'luong_concat':
+            # (kdim + qdim, adim, bias=False)
+            self.w = laeyrs.Dense(adim, use_bias=False)
+            #(adim, 1, bias=False)
+            self.v = layers.Dense(adim, 1, use_bias=False)
+
+        else:
+            raise ValueError(atype)
+
+    def reset(self):
+        self.key = None
+        self.mask = None
+
+    def call(self, key, value, query, mask=None, aw_prev=None,
+                cache=False, mode='', trigger_points=None):
+        """Forward pass.
+        Args:
+            key (FloatTensor): `[B, klen, kdim]`
+            klens (IntTensor): `[B]`
+            value (FloatTensor): `[B, klen, vdim]`
+            query (FloatTensor): `[B, 1, qdim]`
+            mask (ByteTensor): `[B, qlen, klen]`
+            aw_prev (FloatTensor): `[B, 1 (H), 1 (qlen), klen]`
+            cache (bool): cache key and mask
+            mode: dummy interface for MoChA/MMA
+            trigger_points (IntTensor): `[B]`
+        Returns:
+            cv (FloatTensor): `[B, 1, vdim]`
+            aw (FloatTensor): `[B, 1 (H), 1 (qlen), klen]`
+            beta: dummy interface for MoChA/MMA
+            p_choose_i: dummy interface for MoChA/MMA
+        """
+        bs, klen = tf.shape(key)[:2]
+        qlen = tf.shape(query)[1]
+
+        if aw_prev is None:
+            aw_prev = tf.zeros([bs, 1, klen])
+        else:
+            aw_prev = tf.squeeze(aw_prev, 1)  # remove head dimension
+
+        # Pre-computation of encoder-side features for computing scores
+        if self.key is None or not cache:
+            if self.atype in ['add', 'triggered_attention',
+                              'location', 'dot', 'luong_general']:
+                self.key = self.w_key(key)
+            else:
+                self.key = key
+            self.mask = mask
+            if mask is not None:
+                assert self.mask.shape == (bs, 1, klen), (self.mask.shape, (bs, 1, klen))
+
+        # for batch beam search decoding
+        if tf.shape(self.key)[0] != tf.shape(query)[0]:
+            self.key = tf.tile(self.key[0:1, :, :], [tf.shape(query)[0], 1, 1])
+
+        if self.atype == 'no':
+            raise NotImplementedError
+
+        elif self.atype in ['add', 'triggered_attention']:
+            tmp = tf.expand_dims(self.key, axis=1) + tf.expand_dims(self.w_query(query), axis=2)
+            e = tf.squeeze(self.v(tf.tanh(tmp)), 3)
+
+        elif self.atype == 'location':
+            conv_feat = tf.squeeze(self.conv(tf.expand_dims(aw_prev, -1)), 1)  # `[B, klen, ch]`
+            conv_feat = tf.expand_dims(conv_feat, 1)  # `[B, 1, klen, ch]`
+            tmp = tf.expand_dims(self.key, 1) + tf.expand_dims(self.w_query(query), 2) #[B, qlen, klen, adim]
+            e = tf.squeeze(self.v(tf.tanh(tmp + self.w_conv(conv_feat))), 3) #[B, qlen, klen]
+
+        elif self.atype == 'dot':
+            e = tf.linalg.matmul(self.w_query(query), tf.transpose(self.key, (2, 1)))
+
+        elif self.atype in ['luong_dot', 'luong_general']:
+            e = tf.linalg.matmul(query, tf.transpose(self.key, (2, 1)))
+
+        elif self.atype == 'luong_concat':
+            query = tf.tile(query, [1, klen, 1])
+            e = tf.transpose(self.v(tf.tanh(self.w(tf.concat([self.key, query], axis=-1)))), (2, 1))
+        assert e.shape == (bs, qlen, klen), (e.size(), (bs, qlen, klen))
+
+        NEG_INF = float(np.finfo(tf.constant(0, dtype=e.dtype).numpy().dtype).min)
+
+        # Mask the right part from the trigger point
+        if self.atype == 'triggered_attention':
+            assert trigger_points is not None
+            for b in tf.range(bs):
+                e[b, :, trigger_points[b] + self.lookahead + 1:] = NEG_INF
+
+        # Compute attention weights, context vector
+        if self.mask is not None:
+            m = tf.cast(self.mask, tf.float32) * NEG_INF
+            e = e * m
+        if self.sigmoid_smoothing:
+            aw = tf.math.sigmoid(e) / tf.expand_dims(tf.reduce_sum(tf.math.sigmoid(e), -1), -1)
+        else:
+            aw = tf.nn.softmax(e * self.sharpening_factor, axis=-1)
+        aw = self.dropout(aw)
+        cv = tf.linalg.matmul(aw, value)
+        #print('key:', self.key.shape)
+        #print('e:', e.shape)
+        #print('aw:', aw.shape)
+        #print('cv:', cv.shape)
+        #print('value:', value.shape)
+
+        return cv, tf.expand_dims(aw, 1), None, None

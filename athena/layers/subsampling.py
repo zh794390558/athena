@@ -1,31 +1,5 @@
 import tensorflow as tf
-from tensorflow.python.keras.utils import conv_utils
-
-def update_lens_1d(seq_lens, layer):
-    """ update lengths (frequencey or time).
-    Args:
-        seq_lens (IntTensor): `[B]`
-        layer (layers.Conv1d or layers.MaxPool1d):
-    Returns:
-        seq_lens (IntTensor): `[B]`
-    """
-    if seq_lens is None:
-        return seq_lens
-    assert isinstance(seq_lens, tf.Tensor)
-    layers = tf.keras.layers
-    assert type(layer) in [layers.Conv1D, layers.MaxPool1D]
-    seq_lens = [_update_1d(seq_len, layer) for seq_len in seq_lens]
-    seq_lens = tf.stack(seq_lens, axis=0)
-    return seq_lens
-
-
-def _update_1d(seq_len, layer):
-    layers = tf.keras.layers
-    if type(layer) == layers.MaxPool1D: 
-        return conv_utils.conv_output_length(seq_len, layer.pool_size[0], layer.padding, layer.strides[0])
-    else:
-        return conv_utils.conv_output_length(seq_len, layer.pool_size[0], layer.padding, layer.strides[0])
-
+from conv import update_lens_1d
 
 class ConcatSubsampler(tf.keras.layers.Layer):
     """Subsample by concatenating successive input frames."""
