@@ -78,7 +78,45 @@ class LAS(tf.keras.layers.Layer):
             bidir_sum_fwd_bwd=True, param_init=0.01,
             chunk_size_left='-1', chunk_size_right='0')
 
-        self.decoder = TransformerDecoder(decoder_layers)
+        self.decoder = RNNDecoder(
+             special_symbols={'blank': 0, 'unk': 1, 'eos': 2, 'pad': 3},
+             enc_n_units=self.encoder.output_dim,
+             attn_type='location',
+             rnn_type='lstm',
+             n_units=1024,
+             n_projs=0,
+             n_layers=1,
+             bottleneck_dim=1024,
+             emb_dim=512,
+             vocab=VOCAB,
+             tie_embedding=False,
+             attn_dim=512,
+             attn_sharpening_factor=1.0,
+             attn_sigmoid_smoothing=False,
+             attn_conv_out_channels=10,
+             attn_conv_kernel_size=201,
+             attn_n_heads=1,
+             dropout=0.4,
+             dropout_emb=0.4,
+             dropout_att=0.0,
+             lsm_prob=0.1,
+             ss_prob=0.2,
+             ctc_weight=0.0,
+             ctc_lsm_prob=0.1,
+             ctc_fc_list='512',
+             mbr_training=False,
+             mbr_ce_weight=0.01,
+             external_lm=None,
+             lm_fusion='',
+             lm_init=False,
+             backward=False,
+             global_weight=1.0,
+             mtl_per_batch=False,
+             param_init=0.1,
+             gmm_attn_n_mixtures=1,
+             replace_sos=False,
+             distillation_weight=0.0,
+             discourse_aware=False)
 
         self.d_model = d_model
         self.nhead = nhead
