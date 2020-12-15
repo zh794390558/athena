@@ -484,6 +484,7 @@ def pad_list(xs, pad_value=0., pad_left=False):
     xs_pad = tf.stack(xs_pad)
     return xs_pad
 
+
 def make_pad_mask(seq_lens):
     """Make mask for padding.
     Args:
@@ -497,6 +498,7 @@ def make_pad_mask(seq_lens):
     seq_range = tf.tile(tf.expand_dims(seq_range, 0), (bs, 1))
     mask = seq_range < tf.expand_dims(seq_lens, -1)
     return mask
+
 
 def append_sos_eos(ys, sos, eos, pad, device, bwd=False, replace_sos=False):
     """Append <sos> and <eos> and return padded sequences.
@@ -978,13 +980,14 @@ class RNNDecoder(tf.keras.layers.Layer):
     def decode_step(self, eouts, dstates, cv, y_emb, mask, aw, lmout,
                     mode='hard', trigger_points=None, cache=True):
         print('step:')
-        print(y_emb.shape)
-        print(cv.shape)
+        print('yemb', y_emb.shape)
+        print('cv', cv.shape)
         dstates = self.recurrency(tf.concat([y_emb, cv], axis=-1), dstates['dstate'])
         cv, aw, beta, p_choose = self.score(eouts, eouts, dstates['dout_score'], mask, aw,
                                             cache=cache, mode=mode, trigger_points=trigger_points)
-        print(cv.shape)
+        print('cv', cv.shape)
         attn_v = self.generate(cv, dstates['dout_gen'], lmout)
+        print('attn_v', attn_v.shape)
         return dstates, cv, aw, attn_v, beta, p_choose
 
     def recurrency(self, inputs, dstate):
@@ -1059,6 +1062,137 @@ class RNNDecoder(tf.keras.layers.Layer):
             out = self.output_bn(tf.concat([dout, cv], axis=-1))
         attn_v = tf.math.tanh(out)
         return attn_v
+
+    def greedy(self, eouts, elens, max_len_ratio, idx2token,
+            exclude_eos=False, refs_id=None, utt_ids=None, speakers=None,
+            trigger_points=None):
+        """Greedy decoding.
+        Args:
+            eouts (FloatTensor): `[B, T, enc_units]`
+            elens (IntTensor): `[B]`
+            max_len_ratio (int): maximum sequence length of tokens
+            idx2token (): converter from index to token
+            exclude_eos (bool): exclude <eos> from hypothesis
+            refs_id (list): reference list
+            utt_ids (list): utterance id list
+            speakers (list): speaker list
+            trigger_points (IntTensor): `[B, T]`
+        Returns:
+            hyps (list): length `B`, each of which contains arrays of size `[L]`
+            aws (list): length `B`, each of which contains arrays of size `[H, L, T]`
+        """
+        bs, xmax = tf.shape(eouts)[:2]
+        
+        #initialization
+        dstates = self.zero_state(bs) 
+        if self.discourse_aware and not self._new_session:
+            dstates = {'dstate': (self.dstate_prev['hxs'], self.dstate_prev['cxs'])}
+        #self.dstate_prev = {'hxs': [None] * bs, 'cxs': [None] * bs}
+        self.dstate_prev = {'hxs': [tf.zeros(0)] * bs, 'cxs': [tf.zeros(0)] * bs}
+        self._new_session = False
+        cv = tf.zeros((bs, 1, self.enc_n_units))
+        self.score.reset()
+        aw = None
+        lmout, lmstate = None, None
+        y = tf.ones((bs, 1), dtype=tf.int64) 
+        y = y * refs_id[0][0] if self.replace_sos else y * self.eos
+
+        # Create the attention mask
+        src_mask = tf.expand_dims(make_pad_mask(elens), axis=1)  # `[B, 1, T]`
+
+        if self.attn_type == 'triggered_attention':
+            assert trigger_points is not None
+
+        hyps_batch, aws_batch = [], []
+        ylens = [tf.zeros(1, dtype=tf.int64) for b in tf.range(bs)]
+        eos_flags = [False for b in tf.range(bs)]
+        ymax = tf.math.ceil(tf.cast(xmax, tf.float32) * max_len_ratio)
+        for i in tf.range(ymax):
+            # Update LM states for LM fusion
+            if self.lm is not None:
+                lmout, lmstate, _ = self.lm.predict(y, lmstate)
+
+            # Recurrency -> Score -> Generate
+            y_emb = self.dropout_emb(self.embed(y))
+            dstates, cv, aw, attn_v, _, _ = self.decode_step(
+                eouts, dstates, cv, y_emb, src_mask, aw, lmout,
+                trigger_points=trigger_points[:, i:i + 1] if trigger_points is not None else None)
+            aws_batch += [aw]  # `[B, H, 1, T]`
+
+            # Pick up 1-best
+            y = self.output_layer(attn_v)
+            y = tf.math.argmax(y, -1)
+            hyps_batch += [y]
+
+            # Count lengths of hypotheses
+            for b in tf.range(bs):
+                if not eos_flags[b]:
+                    if y[b] == self.eos:
+                        eos_flags[b] = True
+                        if self.discourse_aware:
+                            self.dstate_prev['hxs'][b] = dstates['dstate'][0][:, b:b + 1]
+                            if self.rnn_type == 'lstm':
+                                self.dstate_prev['cxs'][b] = dstates['dstate'][1][:, b:b + 1]
+                    ylens[b] += 1  # include <eos>
+
+            # Break if <eos> is outputed in all mini-batch
+            if sum(eos_flags) == bs:
+                break
+            if i == ymax - 1:
+                break
+
+        # ASR state carry over
+        if self.discourse_aware:
+            if bs > 1:
+                self.dstate_prev['hxs'] = tf.concat(self.dstate_prev['hxs'], dim=1)
+                if self.rnn_type == 'lstm':
+                    self.dstate_prev['cxs'] = tf.concat(self.dstate_prev['cxs'], dim=1)
+            else:
+                self.dstate_prev['hxs'] = self.dstate_prev['hxs']
+                if self.rnn_type == 'lstm':
+                    self.dstate_prev['cxs'] = self.dstate_prev['cxs']
+
+        # LM state carry over
+        self.lmstate_final = lmstate
+
+        # Concatenate in L dimension
+        ylens = tensor2np(tf.concat(ylens, axis=0))
+        hyps_batch = tensor2np(tf.concat(hyps_batch, axis=1))
+        aws_batch = tensor2np(tf.concat(aws_batch, axis=2))  # `[B, H, L, T]`
+
+        # Truncate by the first <eos> (<sos> in case of the backward decoder)
+        if self.bwd:
+            # Reverse the order
+            hyps = [hyps_batch[b, :ylens[b]][::-1] for b in range(bs)]
+            aws = [aws_batch[b, :, :ylens[b]][::-1] for b in range(bs)]
+        else:
+            hyps = [hyps_batch[b, :ylens[b]] for b in range(bs)]
+            aws = [aws_batch[b, :, :ylens[b]] for b in range(bs)]
+
+        # Exclude <eos> (<sos> in case of the backward decoder)
+        if exclude_eos:
+            if self.bwd:
+                hyps = [hyps[b][1:] if eos_flags[b] else hyps[b] for b in range(bs)]
+                aws = [aws[b][:, 1:] if eos_flags[b] else aws[b] for b in range(bs)]
+            else:
+                hyps = [hyps[b][:-1] if eos_flags[b] else hyps[b] for b in range(bs)]
+                aws = [aws[b][:, :-1] if eos_flags[b] else aws[b] for b in range(bs)]
+
+
+        if idx2token is not None:
+            for b in range(bs):
+                if utt_ids is not None:
+                    logger.debug('Utt-id: %s' % utt_ids[b])
+                if refs_id is not None and self.vocab == idx2token.vocab:
+                    logger.debug('Ref: %s' % idx2token(refs_id[b]))
+                if self.bwd:
+                    logger.debug('Hyp: %s' % idx2token(hyps[b][::-1]))
+                else:
+                    logger.debug('Hyp: %s' % idx2token(hyps[b]))
+                logger.info('=' * 200)
+                # NOTE: do not show with logger.info here
+
+        return hyps, aws
 
 
 if __name__ == '__main__':
@@ -1280,3 +1414,8 @@ if __name__ == '__main__':
 
    outs = dec.call(eouts['ys']['xs'], eouts['ys']['xlens'], ys, task='all', teacher_logits=None, recog_params={}, idx2token=None, trigger_points=None)
    print(outs)
+   hyps, aws = dec.greedy(eouts['ys']['xs'], eouts['ys']['xlens'], 0.8, idx2token=None,
+                exclude_eos=False, refs_id=None, utt_ids=None, speakers=None,
+                trigger_points=None)
+   print(hyps)
+   print(aws)
