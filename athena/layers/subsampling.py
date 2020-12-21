@@ -1,5 +1,5 @@
 import tensorflow as tf
-from conv import update_lens_1d
+from .conv import update_lens_1d
 
 class ConcatSubsampler(tf.keras.layers.Layer):
     """Subsample by concatenating successive input frames."""

@@ -37,6 +37,7 @@ SUPPORTED_DATASET_BUILDER = {
 
 SUPPORTED_MODEL = {
     "deep_speech": DeepSpeechModel,
+    "mtl_las_ctc": SpeechLAS,
     "speech_transformer": SpeechTransformer,
     "speech_transformer2": SpeechTransformer2,
     "mtl_transformer_ctc": MtlTransformerCtc,

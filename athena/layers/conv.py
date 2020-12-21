@@ -1,7 +1,7 @@
 import tensorflow as tf
 import logging
 import numpy as np
-from initialization import (
+from .initialization import (
     init_with_lecun_normal,
     init_with_uniform,
     init_with_xavier_uniform,
@@ -257,7 +257,7 @@ class Conv2dBlock(tf.keras.layers.Layer):
 
         super().__init__()
 
-        print(out_channel, kernel_size, stride, pooling)
+        print('conv param:', out_channel, kernel_size, stride, pooling)
 
         self.batch_norm = batch_norm
         self.layer_norm = layer_norm

@@ -1,6 +1,7 @@
 import math
 import numpy as np
 import tensorflow as tf
+from absl import logging
 
 def cross_entropy_lsm(logits, ys, lsm_prob, ignore_index, training, normalize_length=False):
     """Compute cross entropy loss for label smoothing of sequence-to-sequence models.
@@ -19,7 +20,10 @@ def cross_entropy_lsm(logits, ys, lsm_prob, ignore_index, training, normalize_le
     mask = tf.cast((ys != ignore_index), tf.float32)
     logits = tf.reshape(logits, [-1, vocab])
 
+    #logging.info(f"xent: {training} {lsm_prob}")
+    #logging.info(f"phase {tf.keras.backend.learning_phase()}")
     if lsm_prob == 0 or not training:
+        #logging.info(f"xent: sys")
         loss = tf.keras.backend.sparse_categorical_crossentropy(ys, logits, from_logits=True)
         loss *= mask
         loss = tf.reduce_sum(loss) / tf.reduce_sum(mask)
@@ -31,15 +35,22 @@ def cross_entropy_lsm(logits, ys, lsm_prob, ignore_index, training, normalize_le
         target_dist = target_dist * tf.expand_dims(mask, -1)
         target_dist = tf.stop_gradient(target_dist)
         
-        log_probs = tf.nn.log_softmax(logits, axis=-1)
+        log_probs = tf.nn.log_softmax(logits + 1e-5, axis=-1)
         log_probs *= tf.expand_dims(mask, -1)
-        loss_sum = - tf.reduce_sum(target_dist * log_probs, -1)
+        loss_sum = -tf.reduce_sum(tf.math.multiply_no_nan(log_probs, target_dist), -1)
         n_tokens = tf.reduce_sum(mask)
         denom = n_tokens if normalize_length else bs
         loss = tf.reduce_sum(loss_sum) / tf.cast(denom, loss_sum.dtype)
+        #logging.info(f"logits: {tf.reduce_sum(logits, -1)}")
+        #logging.info(f"log probs: {tf.reduce_sum(log_probs, -1)}")
+        #logging.info(f"losses: {loss_sum}")
+        #logging.info(f"mask: {mask}")
+        #logging.info(f"nume: {tf.reduce_sum(loss_sum)}")
+        #logging.info(f"denom: {denom}")
 
         ppl = tf.math.exp(loss) if normalize_length else tf.math.exp(loss * tf.cast(bs, loss.dtype) / n_tokens)
         
+    loss = tf.debugging.check_numerics(loss, 'loss nan or inf')
     return loss, ppl
 
 

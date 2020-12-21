@@ -66,6 +66,8 @@ class MetricChecker:
         if metrics is not None:
             for name in metrics:
                 metric = metrics[name]
+                if metric is None:
+                    continue
                 tf.summary.scalar(name, metric, step=global_steps)
 
         reports = ""
@@ -78,6 +80,8 @@ class MetricChecker:
         if metrics is not None:
             for name in metrics:
                 metric = metrics[name]
+                if metric is None:
+                    continue
                 reports += "%s: %.4f\t" % (name, metric)
         right_now = time.time()
         duration = right_now - self.time_last_call
@@ -107,6 +111,8 @@ class MetricChecker:
             if metrics is not None:
                 for name in metrics:
                     metric = metrics[name]
+                    if metric is None:
+                        continue
                     tf.summary.scalar("evaluate_" + name, metric, step=global_steps)
             reports += "epoch: %d\t" % (epoch)
         reports += "loss: %.4f\t" % (total_loss)
@@ -116,5 +122,7 @@ class MetricChecker:
         if metrics is not None:
             for name in metrics:
                 metric = metrics[name]
+                if metric is None:
+                    continue
                 reports += "%s: %.4f\t" % (name, metric)
         return reports

@@ -80,11 +80,17 @@ class BaseSolver(tf.keras.Model):
         """ clip norm using tf.clip_by_norm """
         if norm <= 0:
             return grads
-        grads = [
-            None if gradient is None else tf.clip_by_norm(gradient, norm)
-            for gradient in grads
-        ]
-        return grads
+
+        #grads = [
+        #    None if gradient is None else tf.clip_by_norm(gradient, norm)
+        #    for gradient in grads
+        #]
+
+        ograds, global_norm = tf.clip_by_global_norm(grads, norm)
+        update = True
+        if tf.math.is_nan(global_norm) or tf.math.is_inf(global_norm):
+            update = False
+        return ograds, update, global_norm
 
     def train_step(self, samples):
         """ train the model 1 step """
@@ -94,12 +100,18 @@ class BaseSolver(tf.keras.Model):
             loss, metrics = self.model.get_loss(outputs, samples, training=True)
             total_loss = sum(list(loss.values())) if isinstance(loss, dict) else loss
         grads = tape.gradient(total_loss, self.model.trainable_variables)
-        grads = self.clip_by_norm(grads, self.hparams.clip_norm)
-        self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+        grads, update, global_norm = self.clip_by_norm(grads, self.hparams.clip_norm)
+        if update:
+            self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+        else:
+            for grad, var in zip(grads, self.model.trainable_variables):
+                logging.info(f"grad nan or inf: {var.name}  {grad}")
+        metrics['global_norm'] = global_norm
         return loss, metrics
 
     def train(self, dataset, total_batches=-1):
         """ Update the model in 1 epoch """
+        tf.keras.backend.set_learning_phase(1)
         train_step = self.train_step
         if self.hparams.enable_tf_function:
             logging.info("please be patient, enable tf.function, it takes time ...")
@@ -121,6 +133,7 @@ class BaseSolver(tf.keras.Model):
 
     def evaluate(self, dataset, epoch):
         """ evaluate the model """
+        tf.keras.backend.set_learning_phase(0)
         loss_metric = tf.keras.metrics.Mean(name="AverageLoss")
         loss, metrics = None, None
         evaluate_step = self.evaluate_step

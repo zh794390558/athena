@@ -24,22 +24,22 @@ import logging
 import numpy as np
 #from .conv_module import ConvModule
 #from .commons import ACTIVATIONS
-from initialization import (
+from .initialization import (
     init_with_lecun_normal,
     init_with_uniform,
     init_with_xavier_uniform,
     init_like_transformer_xl,
 )
-from subsampling import (
+from .subsampling import (
         AddSubsampler,
         ConcatSubsampler,
         Conv1dSubsampler,
         DropSubsampler,
         MaxpoolSubsampler
 )
-from conv import ConvEncoder
-from attention import AttentionMechanism
-from criterion import cross_entropy_lsm
+from .conv import ConvEncoder
+from .attention import AttentionMechanism
+from .criterion import cross_entropy_lsm
 
 logger = logging.getLogger(__name__)
 
@@ -65,10 +65,11 @@ class LAS(tf.keras.layers.Layer):
         >>> out = transformer_model(src, tgt)
     """
 
-    def __init__(
-        self,
-    ):
-        super().__init__()
+    def __init__(self, hparams, vocab_size, blank, sos, eos, unk, pad, **kwargs):
+        super().__init__(**kwargs)
+        assert(sos == eos)
+        print('vocab', vocab_size, 'blank', blank, 'sos', sos, 'eos', eos, 'unk', unk, 'pad', pad)
+
         self.encoder = RNNEncoder(
             input_dim=80, enc_type='conv_blstm', n_units=512, n_projs=0, last_proj_dim=0, n_layers=5,
             dropout_in=0.4, dropout=0.4,
@@ -79,7 +80,8 @@ class LAS(tf.keras.layers.Layer):
             chunk_size_left='-1', chunk_size_right='0')
 
         self.decoder = RNNDecoder(
-             special_symbols={'blank': 0, 'unk': 1, 'eos': 2, 'pad': 3},
+             #special_symbols={'blank': 0, 'unk': 1, 'eos': 2, 'pad': 3},
+             special_symbols={'blank': blank, 'unk': unk, 'eos': eos, 'pad': pad},
              enc_n_units=self.encoder.output_dim,
              attn_type='location',
              rnn_type='lstm',
@@ -88,7 +90,7 @@ class LAS(tf.keras.layers.Layer):
              n_layers=1,
              bottleneck_dim=1024,
              emb_dim=512,
-             vocab=VOCAB,
+             vocab=vocab_size,
              tie_embedding=False,
              attn_dim=512,
              attn_sharpening_factor=1.0,
@@ -118,29 +120,20 @@ class LAS(tf.keras.layers.Layer):
              distillation_weight=0.0,
              discourse_aware=False)
 
-        self.d_model = d_model
-        self.nhead = nhead
-
-    def call(self, src, tgt, src_mask=None, tgt_mask=None, memory_mask=None,
-             return_encoder_output=False, return_attention_weights=False, training=None):
+    def call(self, src, src_lens, tgt, tgt_lens, training=None):
         """Take in and process masked source/target sequences.
 
         Args:
             src: the sequence to the encoder (required).
+            src_lens: the lengths for the src sequence (required).
             tgt: the sequence to the decoder (required).
-            src_mask: the additive mask for the src sequence (optional).
-            tgt_mask: the additive mask for the tgt sequence (optional).
-            memory_mask: the additive mask for the encoder output (optional).
-            src_key_padding_mask: the ByteTensor mask for src keys per batch (optional).
-            tgt_key_padding_mask: the ByteTensor mask for tgt keys per batch (optional).
-            memory_key_padding_mask: the ByteTensor mask for memory keys per batch (optional).
+            tgt_lens: the lengths for the tgt sequence (required).
 
         Shape:
             - src: :math:`(N, S, E)`.
+            - src_lens: :math:`(N, S)`.
             - tgt: :math:`(N, T, E)`.
-            - src_mask: :math:`(N, S)`.
-            - tgt_mask: :math:`(N, T)`.
-            - memory_mask: :math:`(N, S)`.
+            - tgt_lens: :math:`(N, T)`.
 
             Note: [src/tgt/memory]_mask should be a ByteTensor where True values are positions
             that should be masked with float('-inf') and False values will be unchanged.
@@ -155,27 +148,17 @@ class LAS(tf.keras.layers.Layer):
 
             where S is the source sequence length, T is the target sequence length, N is the
             batch size, E is the feature number
-
-        Examples:
-            >>> output = transformer_model(src, tgt, src_mask=src_mask, tgt_mask=tgt_mask)
         """
 
         if src.shape[0] != tgt.shape[0]:
             raise RuntimeError("the batch number of src and tgt must be equal")
 
-        if src.shape[2] != self.d_model or tgt.shape[2] != self.d_model:
-            raise RuntimeError(
-                "the feature number of src and tgt must be equal to d_model"
-            )
-
-        memory = self.encoder(src, src_mask=src_mask, training=training)
-        output = self.decoder(
-            tgt, memory, tgt_mask=tgt_mask, memory_mask=memory_mask,
-            return_attention_weights=return_attention_weights, training=training
-        )
-        if return_encoder_output:
-            return output, memory
-        return output
+        eouts = self.encoder(src, src_lens)
+        loss, observation = self.decoder(
+            eouts['ys']['xs'], eouts['ys']['xlens'], tgt, tgt_lens,
+            task='all', teacher_logits=None, recog_params={},
+            idx2token=None, trigger_points=None)
+        return loss, observation
 
 
 layers = tf.keras.layers
@@ -420,6 +403,7 @@ class RNNEncoder(tf.keras.layers.Layer):
         """
         return xs, xlens
 
+
 class Padding(tf.keras.layers.Layer):
     '''Padding variable length of sequences.'''
     def __init__(self, enc_type, bidirectional):
@@ -467,6 +451,7 @@ def np2tensor(array, device=None):
     """
     tensor = tf.convert_to_tensor(array)
     return tensor
+
 
 def tensor2np(x):
     """Convert torch.Tensor to np.ndarray.
@@ -567,6 +552,40 @@ def append_sos_eos(ys, sos, eos, pad, device, bwd=False, replace_sos=False):
     return ys_in, ys_out, ylens
 
 
+def append_padded_sos_eos(ys, ylens, sos, eos, pad, device, bwd=False, replace_sos=False):
+    """Append <sos> and <eos> and return padded sequences.
+    Args:
+        ys (tensor):`[B, L]`, which paded with zero
+        sos (int): index for <sos>
+        eos (int): index for <eos>
+        pad (int): index for <pad>
+        bwd (bool): reverse ys for backward reference
+        replace_sos (bool): replace <sos> with the special token
+    Returns:
+        ys_in (LongTensor): `[B, L]`
+        ys_out (LongTensor): `[B, L]`
+        ylens (IntTensor): `[B]`
+    """
+    bs, ymax = tf.shape(ys)[:2]
+    assert(replace_sos == False)
+    assert(bwd == False)
+    assert(pad == 0)
+    if replace_sos:
+        pass
+    else:
+        _sos = tf.ones((bs, 1), dtype=ys.dtype) * sos
+        ys_in = tf.concat([_sos, ys], axis=-1)
+
+        pad = tf.zeros((bs, 1), dtype=ys.dtype)
+        _eos = tf.one_hot(ylens, ymax+1, dtype=ys.dtype) * eos
+        #print(_eos[:8])
+        #print(ylens[:8])
+        #print(ymax)
+        ys_out = tf.concat([ys, pad], axis=-1) + _eos 
+        ylens = ylens + 1
+    return ys_in, ys_out, ylens
+
+
 def compute_accuracy(logits, ys_ref, pad):
     """Compute teacher-forcing accuracy.
     Args:
@@ -579,11 +598,11 @@ def compute_accuracy(logits, ys_ref, pad):
     _, _, vocab = tf.shape(logits)
     bs, time = tf.shape(ys_ref)
     logits = tf.reshape(logits, (bs, time, vocab))
-    pad_pred = tf.math.argmax(logits, 2)
-    mask = tf.cast(ys_ref != pad, pad_pred.dtype)
-    pad_pred *= mask
-    ys_ref *= mask
-    numerator = tf.reduce_sum(tf.cast(pad_pred == ys_ref, tf.float32))
+    pad_pred = tf.cast(tf.math.argmax(logits, 2), tf.int32)
+    mask = tf.cast(ys_ref != pad, tf.float32)
+    #pad_pred *= mask
+    #ys_ref *= mask
+    numerator = tf.reduce_sum(tf.cast(pad_pred == ys_ref, tf.float32) * mask)
     denominator = tf.reduce_sum(tf.cast(mask, tf.float32))
     acc = numerator * 100 / denominator
     return acc
@@ -732,33 +751,34 @@ class RNNDecoder(tf.keras.layers.Layer):
         self.rnn = []
         cell = layers.LSTMCell if rnn_type == 'lstm' else layers.GRUCell
         dec_odim = enc_n_units + emb_dim
-        self.proj = [nn.Linear(n_units, n_projs) for i in range(n_layers)] if n_projs > 0 else None
+        # (n_units, n_projs)
+        self.proj = [layers.Dense(n_projs) for i in range(n_layers)] if n_projs > 0 else None
         self.dropout = layers.Dropout(dropout)
         for _ in range(n_layers):
-            #self.rnn += [cell(dec_odim, n_units)]
+            #(dec_odim, n_units)
             self.rnn += [cell(n_units)]
             dec_odim = n_projs if n_projs > 0 else n_units
 
         # RNNLM fusion
         if external_lm is not None and lm_fusion:
-            #self.linear_dec_feat = nn.Linear(dec_odim + enc_n_units, n_units)
+            # (dec_odim + enc_n_units, n_units)
             self.linear_dec_feat = layers.Dense(n_units)
             if lm_fusion in ['cold', 'deep']:
-                #self.linear_lm_feat = nn.Linear(external_lm.output_dim, n_units)
+                # (external_lm.output_dim, n_units)
                 self.linear_lm_feat = layers.Dense(n_units)
-                #self.linear_lm_gate = nn.Linear(n_units * 2, n_units)
+                # (n_units * 2, n_units)
                 self.linear_lm_gate = layers.Dense(n_units)
             elif lm_fusion == 'cold_prob':
-                #self.linear_lm_feat = nn.Linear(external_lm.vocab, n_units)
+                # (external_lm.vocab, n_units)
                 self.linear_lm_feat = layers.Dense(n_units)
-                #self.linear_lm_gate = nn.Linear(n_units * 2, n_units)
+                # (n_units * 2, n_units)
                 self.linear_lm_gate = layers.Dense(n_units)
             else:
                 raise ValueError(lm_fusion)
-            #self.output_bn = nn.Linear(n_units * 2, bottleneck_dim)
+            # (n_units * 2, bottleneck_dim)
             self.output_bn = layers.Dense(bottleneck_dim)
         else:
-            #self.output_bn = nn.Linear(dec_odim + enc_n_units, bottleneck_dim)
+            # (dec_odim + enc_n_units, bottleneck_dim)
             self.output_bn = layers.Dense(bottleneck_dim)
 
 
@@ -771,7 +791,7 @@ class RNNDecoder(tf.keras.layers.Layer):
         if tie_embedding:
             if emb_dim != bottleneck_dim:
                 raise ValueError('When using the tied flag, n_units must be equal to emb_dim.')
-            self.output_layer.kernel.assing(self.embed.kernel)
+            self.output_layer.kernel.assign(self.embed.kernel)
 
         #self.reset_parameters(param_init)
 
@@ -799,15 +819,13 @@ class RNNDecoder(tf.keras.layers.Layer):
                 var.assign(tf.constant(-1))
                 logger.info('Initialize %s with %s / %.3f' % (n, 'constant', -1.))
                 continue
-
             init_with_uniform(var, param_init)
-
 
     @property
     def training(self):
         return tf.keras.backend.learning_phase()
 
-    def call(self, eouts, elens, ys, task='all',
+    def call(self, eouts, elens, ys, ylens, task='all',
         teacher_logits=None, recog_params={}, idx2token=None, trigger_points=None):
         """Forward pass.
         Args:
@@ -825,7 +843,7 @@ class RNNDecoder(tf.keras.layers.Layer):
         """
         observation = {'loss': None, 'loss_att': None, 'loss_ctc': None, 'loss_mbr': None,
                        'acc_att': None, 'ppl_att': None}
-        loss = tf.zeros(1) 
+        loss = tf.constant(0.0)
 
         # CTC loss
         if self.ctc_weight > 0 and (task == 'all' or 'ctc' in task):
@@ -843,9 +861,9 @@ class RNNDecoder(tf.keras.layers.Layer):
         # XE loss
         if self.att_weight > 0 and (task == 'all' or 'ctc' not in task) and self.mbr is None:
             loss_att, acc_att, ppl_att, loss_quantity, loss_latency = self.forward_att(
-                eouts, elens, ys, teacher_logits=teacher_logits,
+                eouts, elens, ys, ylens, teacher_logits=teacher_logits,
                 ctc_trigger_points=ctc_trigger_points, forced_trigger_points=trigger_points)
-            observation['loss_att'] = tensor2scalar(loss_att)
+            observation['loss_att'] = loss_att
             observation['acc_att'] = acc_att
             observation['ppl_att'] = ppl_att
             if self.mtl_per_batch:
@@ -857,7 +875,7 @@ class RNNDecoder(tf.keras.layers.Layer):
         if self.mbr is not None and (task == 'all' or 'mbr' not in task):
             pass
 
-        observation['loss'] = tensor2scalar(loss)
+        observation['loss'] = loss
         return loss, observation
 
     def zero_state(self, bs):
@@ -879,7 +897,7 @@ class RNNDecoder(tf.keras.layers.Layer):
         return dstates
 
 
-    def forward_att(self, eouts, elens, ys,
+    def forward_att(self, eouts, elens, ys, ylens,
                     return_logits=False, teacher_logits=None,
                     ctc_trigger_points=None, forced_trigger_points=None):
         """Compute XE loss for the attention-based decoder.
@@ -901,11 +919,11 @@ class RNNDecoder(tf.keras.layers.Layer):
         bs, xmax = tf.shape(eouts)[:2]
 
         # Append <sos> and <eos>
-        print('ys:', ys)
-        ys_in, ys_out, ylens = append_sos_eos(ys, self.eos, self.eos, self.pad, eouts.device, self.bwd)
-        print('ysin:', ys_in)
-        print('ysout:', ys_out)
-        print('yslen:', ylens)
+        #print('ys:', ys)
+        ys_in, ys_out, ylens = append_padded_sos_eos(ys, ylens, self.eos, self.eos, self.pad, eouts.device, self.bwd)
+        #print('ysin:', ys_in)
+        #print('ysout:', ys_out)
+        #print('yslen:', ylens)
         ymax = tf.shape(ys_in)[1]
 
         # Initialization
@@ -913,7 +931,8 @@ class RNNDecoder(tf.keras.layers.Layer):
         if self.training:
             if self.discourse_aware and not self._new_session:
                 dstates = {'dstate': (self.dstate_prev['hxs'], self.dstate_prev['cxs'])}
-            self.dstate_prev = {'hxs': [None] * bs, 'cxs': [None] * bs}
+            #self.dstate_prev = {'hxs': [None] * bs, 'cxs': [None] * bs}
+            self.dstate_prev = {'hxs': [tf.zeros(0)] * bs, 'cxs': [tf.zeros(0)] * bs}
             self._new_session = False
         cv = tf.zeros([bs, 1, self.enc_n_units])
         self.score.reset()
@@ -925,7 +944,7 @@ class RNNDecoder(tf.keras.layers.Layer):
         ys_emb = self.dropout_emb(self.embed(ys_in))
         src_mask = tf.expand_dims(make_pad_mask(elens), axis=1)  # `[B, 1, T]`
         tgt_mask = tf.expand_dims((ys_out != self.pad), 2)  # `[B, L, 1]`
-        logits = []
+        logits_list = []
         for i in tf.range(ymax):
             is_sample = i > 0 and self._ss_prob > 0 and random.random() < self._ss_prob
 
@@ -939,10 +958,10 @@ class RNNDecoder(tf.keras.layers.Layer):
 
             # Recurrency -> Score -> Generate
             y_emb = self.dropout_emb(self.embed(
-                tf.math.argmax(tf.stop_gradient(self.output_layer(logits[-1])), -1))) if is_sample else ys_emb[:, i:i + 1]
-            if is_sample:
-                print('ii', tf.math.argmax(tf.stop_gradient(self.output_layer(logits[-1])), -1))
-            print('xx', y_emb.shape)
+                tf.math.argmax(tf.stop_gradient(self.output_layer(logits_list[-1])), -1))) if is_sample else ys_emb[:, i:i + 1]
+            #if is_sample:
+            #    print('ii', tf.math.argmax(tf.stop_gradient(self.output_layer(logits_list[-1])), -1))
+            #print('xx', y_emb.shape)
             dstates, cv, aw, attn_v, beta, p_choose = self.decode_step(
                 eouts, dstates, cv, y_emb, src_mask, aw, lmout, mode='parallel',
                 trigger_points=forced_trigger_points[:, i:i + 1] if forced_trigger_points is not None else None)
@@ -951,7 +970,16 @@ class RNNDecoder(tf.keras.layers.Layer):
                 betas.append(beta)  # `[B, H, 1, T]`
             if p_choose is not None:
                 p_chooses.append(p_choose)  # `[B, H, 1, T]`
-            logits.append(attn_v)
+            if tf.math.is_nan(tf.reduce_sum(attn_v)):
+                print(f"is sample {is_sample}")
+                print(f"input {y_emb}")
+                print(f"cv {cv}")
+                print(f"aw {aw}")
+                print(f"i {i}/{ymax} {attn_v.shape} {attn_v[:2]}")
+                tf.print(attn_v, summarize=-1)
+                raise ValueError("nan")
+            tf.debugging.check_numerics(attn_v, "attn_v has nan or inf")
+            logits_list.append(attn_v)
 
             if self.training and self.discourse_aware:
                 for b in [b for b, ylen in enumerate(ylens.tolist()) if i == ylen - 1]:
@@ -969,7 +997,7 @@ class RNNDecoder(tf.keras.layers.Layer):
                 if self.rnn_type == 'lstm':
                     self.dstate_prev['cxs'] = self.dstate_prev['cxs'][0]
 
-        logits = self.output_layer(tf.concat(logits, axis=1))
+        logits = self.output_layer(tf.concat(logits_list, axis=1))
 
         # for knowledge distillation
         if return_logits:
@@ -992,7 +1020,7 @@ class RNNDecoder(tf.keras.layers.Layer):
         n_heads = tf.shape(aws)[1]  # mono
 
         # Compute XE sequence loss (+ label smoothing)
-        loss, ppl = cross_entropy_lsm(logits, ys_out, self.lsm_prob, self.pad, self.training)
+        loss, ppl = cross_entropy_lsm(logits, ys_out, self.lsm_prob, self.pad, self.training, normalize_length=True)
 
         # Attention padding
         if self.attn_type == 'mocha' or (ctc_trigger_points is not None or forced_trigger_points is not None):
@@ -1017,15 +1045,15 @@ class RNNDecoder(tf.keras.layers.Layer):
 
     def decode_step(self, eouts, dstates, cv, y_emb, mask, aw, lmout,
                     mode='hard', trigger_points=None, cache=True):
-        print('step:')
-        print('yemb', y_emb.shape)
-        print('cv', cv.shape)
+        #print('step:')
+        #print('yemb', y_emb.shape)
+        #print('cv', cv.shape)
         dstates = self.recurrency(tf.concat([y_emb, cv], axis=-1), dstates['dstate'])
         cv, aw, beta, p_choose = self.score(eouts, eouts, dstates['dout_score'], mask, aw,
                                             cache=cache, mode=mode, trigger_points=trigger_points)
-        print('cv', cv.shape)
+        #print('cv', cv.shape)
         attn_v = self.generate(cv, dstates['dout_gen'], lmout)
-        print('attn_v', attn_v.shape)
+        #print('attn_v', attn_v.shape)
         return dstates, cv, aw, attn_v, beta, p_choose
 
     def recurrency(self, inputs, dstate):

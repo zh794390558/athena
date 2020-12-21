@@ -726,7 +726,10 @@ class AttentionMechanism(tf.keras.layers.Layer):
             e = tf.transpose(self.v(tf.tanh(self.w(tf.concat([self.key, query], axis=-1)))), (2, 1))
         assert e.shape == (bs, qlen, klen), (e.size(), (bs, qlen, klen))
 
-        NEG_INF = float(np.finfo(tf.constant(0, dtype=e.dtype).numpy().dtype).min)
+        NEG_INF = 1e-8 
+
+        #print(f'e: {e}')
+        #print(f'value: {value}')
 
         # Mask the right part from the trigger point
         if self.atype == 'triggered_attention':
@@ -738,10 +741,15 @@ class AttentionMechanism(tf.keras.layers.Layer):
         if self.mask is not None:
             m = tf.cast(self.mask, tf.float32) * NEG_INF
             e = e * m
+            #print("attn maxk")
+            #print(f"attn maxk: {e}")
+
         if self.sigmoid_smoothing:
             aw = tf.math.sigmoid(e) / tf.expand_dims(tf.reduce_sum(tf.math.sigmoid(e), -1), -1)
         else:
+            #print(f'att softmax: {e}')
             aw = tf.nn.softmax(e * self.sharpening_factor, axis=-1)
+        #print(f"xxx aw: {aw}")
         aw = self.dropout(aw)
         cv = tf.linalg.matmul(aw, value)
         #print('key:', self.key.shape)
@@ -749,5 +757,8 @@ class AttentionMechanism(tf.keras.layers.Layer):
         #print('aw:', aw.shape)
         #print('cv:', cv.shape)
         #print('value:', value.shape)
+
+        #print(f'aw aw: {aw}')
+        #print(f'cv cv: {cv}')
 
         return cv, tf.expand_dims(aw, 1), None, None

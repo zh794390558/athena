@@ -50,6 +50,7 @@ from .layers.resnet_block import ResnetBasicBlock
 # models
 from .models.base import BaseModel
 from .models.speech_transformer import SpeechTransformer, SpeechTransformer2
+from .models.speech_las import SpeechLAS
 from .models.tacotron2 import Tacotron2
 from .models.tts_transformer import TTSTransformer
 from .models.fastspeech import FastSpeech
